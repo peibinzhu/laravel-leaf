@@ -4,12 +4,15 @@ declare(strict_types=1);
 
 namespace PeibinLaravel\Leaf\Segment;
 
+use Illuminate\Cache\RedisLock;
 use Illuminate\Contracts\Cache\Factory;
 use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Contracts\Container\Container;
+use Illuminate\Contracts\Events\Dispatcher;
 use PeibinLaravel\Leaf\Contracts\IDAllocModel;
 use PeibinLaravel\Leaf\IDGen;
 use PeibinLaravel\Leaf\Utils\Result;
+use PeibinLaravel\SwooleEvent\Events\BootApplication;
 
 class SegmentIDGenImpl implements IDGen
 {
@@ -25,10 +28,13 @@ class SegmentIDGenImpl implements IDGen
 
     private bool $initOK;
 
-    public function __construct(Container $container)
+    public function __construct(protected Container $container)
     {
         $this->initOK = false;
-        $this->cahce = $container->get(Factory::class)->store('redis');
+        $this->cahce = $this->container->get(Factory::class)->store('redis');
+        $container->get(Dispatcher::class)->listen(BootApplication::class, function () {
+            $this->cahce = $this->container->get(Factory::class)->store('redis');
+        }, PHP_INT_MIN);
     }
 
     public function init(): bool
@@ -39,13 +45,21 @@ class SegmentIDGenImpl implements IDGen
 
     public function get(string $key): Result
     {
-        // TODO: 在并发情况下有可能出现重复，待后面完善
-
         if (!$this->initOK) {
             return new Result(self::EXCEPTION_ID_IDCACHE_INIT_FALSE, Result::STATUS_EXCEPTION);
         }
 
-        $id = $this->getSegmentFromCache($key) ?: $this->getSegmentFromDb($key);
+        // 分布式锁
+        /** @var RedisLock $lock */
+        $lock = $this->cahce->getStore()->lock('LEAF_SEGMENT_ID_LOCK');
+        $lock->betweenBlockedAttemptsSleepFor(5)->block(5);
+
+        try {
+            $id = $this->getSegmentFromCache($key) ?: $this->getSegmentFromDb($key);
+        } finally {
+            $lock->release();
+        }
+
         if (!$id) {
             return new Result(self::EXCEPTION_ID_KEY_NOT_EXISTS, Result::STATUS_EXCEPTION);
         }
@@ -58,7 +72,7 @@ class SegmentIDGenImpl implements IDGen
         $idKey = $this->getIdKey($key);
         $leafAllocKey = $this->getLeafAllocKey($key);
         $currentId = $this->cahce->get($idKey);
-        /** @var LeafAlloc|null $conf */
+        /** @var LeafAlloc|null $leafAlloc */
         $leafAlloc = $this->cahce->get($leafAllocKey);
         if (!$currentId || !$leafAlloc) {
             return null;
